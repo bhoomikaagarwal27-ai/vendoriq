@@ -398,7 +398,7 @@ with tab_ai:
         c2.caption("Same inputs → same answer: results are cached, so a double-click or a refresh does not spend another API call.")
 
         if run:
-            if ctx_hash in ss.recs:
+            if ctx_hash in ss.recs and ss.recs[ctx_hash]["source"] != "rule-based":
                 pass                                              # idempotent: already have it
             elif ctx_hash in shared_ai_cache():
                 res = shared_ai_cache()[ctx_hash]
