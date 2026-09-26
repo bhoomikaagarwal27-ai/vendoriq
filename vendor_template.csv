@@ -1,0 +1,2 @@
+vendor_id,vendor_name,material,location,origin,price_inr_per_kg,purity_pct,qc_pass_rate_pct,lead_time_days,otif_pct,credit_days,moq_mt,distance_km,complaints_12m,certifications,esg_score,notes
+V101,Your Vendor Name,Methanol,City,Domestic,30.00,99.90,95,5,92,30,10,100,1,ISO 9001;ISO 14001,70,Any free-text remark

@@ -1,0 +1,27 @@
+vendor_id,vendor_name,material,location,origin,price_inr_per_kg,purity_pct,qc_pass_rate_pct,lead_time_days,otif_pct,credit_days,moq_mt,distance_km,complaints_12m,certifications,esg_score,notes
+V001,Aarav Petro Traders,Methanol,Ankleshwar,Domestic,31.20,99.90,98,4,96,30,10,85,1,ISO 9001;ISO 14001,72,Consistent tanker supply; prefers monthly rate contracts.
+V002,BlueRiver Methanol Co.,Methanol,Hazira,Domestic,30.40,99.88,94,6,89,45,20,150,3,ISO 9001,60,Price revised quarterly; two late deliveries during monsoon.
+V003,Coastline Chem Imports,Methanol,Kandla Port,Import,28.60,99.92,97,18,84,60,50,410,2,ISO 9001;ISO 14001,65,Imported cargo; price linked to USD/INR and vessel schedule.
+V004,Dahej Solvent Hub,Methanol,Dahej,Domestic,31.80,99.95,99,3,98,15,5,105,0,ISO 9001;ISO 14001;ISO 45001,85,Premium grade; accepts small lots; short credit only.
+V005,Evergreen Chem Distributors,Methanol,Vapi,Domestic,29.90,99.80,88,7,82,30,15,270,6,,45,Trader (not manufacturer); purity variation seen in two lots.
+V006,Falcon Bulk Liquids,Methanol,Taloja (Navi Mumbai),Domestic,30.10,99.87,95,5,93,30,10,420,1,ISO 9001,68,Reliable; freight is higher due to distance.
+V007,Gujarat Aromatics Supply,Phenol,Bharuch,Domestic,96.50,99.70,97,7,94,30,10,75,1,ISO 9001;ISO 14001,70,Regular supplier for phenolic resin line.
+V008,Horizon Phenolics,Phenol,Hazira Port,Import,91.20,99.60,93,25,80,90,20,150,3,ISO 9001,55,Long credit; supply depends on vessel arrival.
+V009,Indus Petrochem Traders,Phenol,Mumbai,Domestic,98.00,99.80,99,4,97,21,5,420,0,ISO 9001;ISO 14001;ISO 45001,82,Best quality record; highest price in category.
+V010,Jaipur Chem Mart,Phenol,Jaipur,Domestic,94.00,99.50,90,9,85,45,10,650,4,ISO 9001,50,Competitive price; long road transit.
+V011,Konkan Chemicals,Phenol,Taloja (Navi Mumbai),Domestic,95.40,99.75,96,6,92,30,10,440,1,ISO 9001;ISO 14001,74,Stable supplier; open to annual contract.
+V012,Lakshmi Agro Chem,Urea (Technical),Kalol,Domestic,39.50,99.20,95,5,91,30,20,120,2,ISO 9001,62,Technical grade in 50 kg bags.
+V013,Mahi Fertichem,Urea (Technical),Vadodara,Domestic,41.00,99.40,98,2,97,15,10,20,0,ISO 9001;ISO 14001,78,Same-city vendor; can deliver within 48 hours.
+V014,Nova Granules,Urea (Technical),Kandla Port,Import,36.80,99.10,90,21,78,60,100,410,5,ISO 9001,48,Bulk vessel cargo; large minimum order.
+V015,Orbit Industrial Supplies,Urea (Technical),Indore,Domestic,38.90,98.80,86,8,83,30,15,360,4,,40,Occasional caking reported in monsoon.
+V016,Prime Urea Traders,Urea (Technical),Ahmedabad,Domestic,40.20,99.30,96,3,94,21,10,110,1,ISO 9001;ISO 14001,70,Good service; flexible on lot size.
+V017,Quantum Melamine,Melamine,Dahej,Domestic,128.00,99.90,98,5,95,30,5,105,0,ISO 9001;ISO 14001;ISO 45001,84,Manufacturer; consistent particle size.
+V018,Rudra Polymers Trading,Melamine,Ankleshwar,Domestic,124.50,99.85,94,7,90,45,10,85,2,ISO 9001,63,Trader; sources from two plants.
+V019,Sagar Chem Imports,Melamine,Hazira Port,Import,117.00,99.82,91,30,79,60,25,150,3,ISO 9001,52,Attractive price; lead time volatile due to shipping.
+V020,Trident Specialty Chem,Melamine,Vapi,Domestic,126.00,99.88,97,6,93,30,5,270,1,ISO 9001;ISO 14001,76,Reliable; offers quarterly price lock.
+V021,Unity Chem Distributors,Melamine,Mumbai,Domestic,122.00,99.84,92,8,87,30,10,420,3,ISO 9001,58,Mid-range option; average service.
+V022,Vasant Alkalies,Caustic Soda Flakes,Bharuch,Domestic,47.50,98.50,97,3,96,30,5,75,0,ISO 9001;ISO 14001,75,Manufacturer-direct supply.
+V023,Western Chlor-Alkali Traders,Caustic Soda Flakes,Surat,Domestic,46.00,98.20,94,5,91,21,10,150,2,ISO 9001,60,Trader with good stock levels.
+V024,Yamuna Chem Supply,Caustic Soda Flakes,Delhi NCR,Domestic,44.80,98.10,90,9,84,45,20,950,3,ISO 9001,50,Low price but long transit from north India.
+V025,Zenith Industrial Chem,Caustic Soda Flakes,Vadodara,Domestic,48.90,98.60,99,1,98,15,2,15,0,ISO 9001;ISO 14001;ISO 45001,80,Local stockist; premium for small lots.
+V026,Apex Alkali Imports,Caustic Soda Flakes,Kandla Port,Import,42.50,98.00,88,20,76,60,50,410,4,ISO 9001,45,Cheapest landed price; import delays in past year.
