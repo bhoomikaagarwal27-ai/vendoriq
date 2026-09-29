@@ -1,16 +1,15 @@
 """
-ai_engine.py - Everything that talks to the Gemini API, plus the checks that run
-on what comes back. Kept free of Streamlit code so it can be unit-tested.
+ai_engine.py - Everything that talks to the Gemini API, plus the checks on what comes back.
+Kept free of Streamlit code so it can be unit-tested.
 
-Failure handling (what happens if the API is down or returns garbage):
-  * no key / invalid key     -> app switches to rule-based mode and says so
-  * model retired (404)      -> next model in the fallback list is tried
-  * quota hit (429)          -> next model tried (each model has its own quota),
-                                then rule-based fallback
-  * server error / timeout   -> one retry after a short pause, then next model
-  * empty or blocked reply   -> treated as a failure, fallback used
-  * invalid JSON / bad IDs   -> output rejected by validate_recommendation(),
-                                fallback shown next to a warning
+LLM roles:  EXPLORER (propose plan)  ->  JUDGE (review + correct plan)  ->  ANALYST (explain) + CHAT
+Failure handling:
+  * no key / invalid key     -> rule-based mode (heuristic plan, rule-based insights), clearly labelled
+  * model retired (404)      -> next model in the list
+  * quota hit (429)          -> next model (separate quota), then rule-based fallback
+  * server error / timeout   -> one retry, then next model
+  * empty / blocked / invalid JSON -> treated as a failure, fallback used
+  * plausible but wrong output -> caught by planner.validate_plan() and validate_insights()
 """
 from __future__ import annotations
 
@@ -23,37 +22,86 @@ from dataclasses import dataclass, field
 import pandas as pd
 from pydantic import BaseModel, ValidationError
 
-from prompts import (CANNED_INJECTION_REPLY, CHAT_SYSTEM, RECOMMENDER_SYSTEM,
-                     RECOMMENDER_USER_TEMPLATE)
-from scoring import CRITERIA
-from validation import looks_like_injection
+from prompts import (ANALYST_SYSTEM, ANALYST_USER, CANNED_INJECTION_REPLY, CHAT_SYSTEM, EXPLORER_SYSTEM,
+                     EXPLORER_USER, JUDGE_SYSTEM, JUDGE_USER)
+from safety import looks_like_injection
+from scoring import ccol
 
-# Free-tier friendly order: Flash-Lite models have a much larger free daily quota
-# than Flash models. Aliases at the end survive model retirements.
-DEFAULT_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-flash-lite-latest",
-    "gemini-flash-latest",
-]
+DEFAULT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-flash-latest"]
 MAX_CHAT_CHARS = 600
 MAX_HISTORY_TURNS = 8
-ID_PATTERN = re.compile(r"\b[A-Z]\d{3}\b")
 
 
-# ---------------------------------------------------------------- schema
-class VendorRisk(BaseModel):
-    vendor_id: str
+# ---------------------------------------------------------------- schemas
+class Criterion(BaseModel):
+    column: str
+    label: str
+    direction: str
+    weight: float
+    role: str
+    reason: str
+
+
+class Ignored(BaseModel):
+    column: str
+    reason: str
+
+
+class FilterSuggestion(BaseModel):
+    column: str
+    operator: str
+    value: str
+    reason: str
+
+
+class Derived(BaseModel):
+    name: str
+    formula: str
+    direction: str
+    reason: str
+
+
+class DataPlan(BaseModel):
+    dataset_summary: str
+    entity_column: str
+    label_column: str
+    group_column: str
+    criteria: list[Criterion]
+    ignored_columns: list[Ignored]
+    filter_suggestions: list[FilterSuggestion]
+    derived_metrics: list[Derived]
+    data_quality_notes: list[str]
+    analysis_questions: list[str]
+
+
+class Issue(BaseModel):
+    severity: str
+    item: str
+    problem: str
+    fix: str
+
+
+class Verdict(BaseModel):
+    verdict: str
+    issues: list[Issue]
+    corrected_plan: DataPlan
+    confidence: str
+
+
+class OptionRisk(BaseModel):
+    id: str
     risk: str
 
 
-class Recommendation(BaseModel):
-    recommended_vendor_id: str
+class Insights(BaseModel):
+    recommended_id: str
     headline: str
     why: list[str]
-    risks: list[VendorRisk]
+    risks: list[OptionRisk]
+    trade_offs: list[str]
+    anomalies: list[str]
     negotiation_levers: list[str]
-    l1_comparison: str
+    further_analysis: list[str]
     confidence: str
     data_gaps: list[str]
     disagreement_note: str
@@ -73,45 +121,6 @@ class AIResult:
     attempts: list = field(default_factory=list)
 
 
-# ---------------------------------------------------------------- context
-def build_context(scored: pd.DataFrame, disqualified: pd.DataFrame, req: dict, weights_pct: dict,
-                  l1: dict, stability: pd.DataFrame, anonymise: bool = True) -> dict:
-    """The ONLY data the model sees. All arithmetic is done here, not by the model."""
-    cols = ["vendor_id", "rank", "score", "tier", "origin", "price_inr_per_kg", "freight_rs_per_kg",
-            "landed_cost", "purity_pct", "qc_pass_rate_pct", "lead_time_days", "otif_pct", "credit_days",
-            "moq_mt", "complaints_12m", "risk_points", "esg_score", "certifications", "notes"]
-    if not anonymise:
-        cols[1:1] = ["vendor_name", "location"]
-    qty_kg = req["qty_mt"] * 1000
-    vendors = []
-    top = scored.iloc[0] if not scored.empty else None
-    for _, r in scored.iterrows():
-        v = {c: (r[c].item() if hasattr(r[c], "item") else r[c]) for c in cols}
-        v["order_value_rs"] = round(float(r["landed_cost"]) * qty_kg)
-        v["points_by_criterion"] = {k: float(r[f"pts_{k}"]) for k in CRITERIA}
-        if top is not None and r["vendor_id"] != top["vendor_id"]:
-            v["gap_vs_top"] = {
-                "score": round(float(r["score"] - top["score"]), 1),
-                "landed_cost_rs_per_kg": round(float(r["landed_cost"] - top["landed_cost"]), 2),
-                "lead_time_days": int(r["lead_time_days"] - top["lead_time_days"]),
-                "otif_pct": round(float(r["otif_pct"] - top["otif_pct"]), 1),
-                "qc_pass_rate_pct": round(float(r["qc_pass_rate_pct"] - top["qc_pass_rate_pct"]), 1),
-                "credit_days": int(r["credit_days"] - top["credit_days"]),
-            }
-        vendors.append(v)
-    dq = [{"vendor_id": r["vendor_id"], "reason": r["disqualified_because"]} for _, r in disqualified.iterrows()]
-    return {
-        "requirement": req,
-        "weights_pct": {k: round(v * 100, 1) for k, v in weights_pct.items()},
-        "scoring_method": "min-max normalised per criterion (1 = best in this list) x weight; total out of 100. "
-                          "Scores are RELATIVE to the vendors in this list.",
-        "qualified_vendors": vendors,
-        "disqualified_vendors": dq,
-        "l1_check": {k: v for k, v in l1.items()},
-        "stability": stability.head(5).to_dict(orient="records"),
-    }
-
-
 def to_json(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, default=lambda o: o.item() if hasattr(o, "item") else str(o))
 
@@ -122,7 +131,7 @@ def cache_key(*parts) -> str:
 
 # ---------------------------------------------------------------- API call
 def call_gemini(api_key: str, system: str, contents, models: list[str], json_schema=None,
-                temperature: float = 0.2, max_tokens: int = 2048, timeout_ms: int = 45000) -> AIResult:
+                temperature: float = 0.2, max_tokens: int = 2048, timeout_ms: int = 60000) -> AIResult:
     """max_tokens includes the model's internal "thinking" tokens on Gemini 3.x, so keep it generous."""
     if not api_key:
         return AIResult(ok=False, source="rule-based", error="No Gemini API key configured.")
@@ -141,7 +150,7 @@ def call_gemini(api_key: str, system: str, contents, models: list[str], json_sch
 
     attempts, last_error = [], "Unknown error"
     for model in models:
-        for attempt in range(2):                      # 1 retry on server/timeout errors
+        for attempt in range(2):
             t0 = time.time()
             try:
                 resp = client.models.generate_content(model=model, contents=contents, config=config)
@@ -151,11 +160,11 @@ def call_gemini(api_key: str, system: str, contents, models: list[str], json_sch
                     reason = ""
                     try:
                         reason = str(resp.candidates[0].finish_reason)
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         pass
                     last_error = f"Empty or blocked response ({reason or 'no text'})."
                     attempts.append((model, "empty"))
-                    break                              # try next model
+                    break
                 usage = getattr(resp, "usage_metadata", None)
                 attempts.append((model, "ok"))
                 return AIResult(ok=True, text=text, model=model, latency_ms=ms, attempts=attempts,
@@ -169,13 +178,10 @@ def call_gemini(api_key: str, system: str, contents, models: list[str], json_sch
                     return AIResult(ok=False, source="rule-based", error="Gemini API key is invalid.", attempts=attempts)
                 if code in (401, 403):
                     return AIResult(ok=False, source="rule-based", error="API key not allowed to use this model/project.", attempts=attempts)
-                if code == 429:
-                    last_error = "Free-tier quota reached (HTTP 429)."
-                elif code == 404:
-                    last_error = f"Model '{model}' not available (HTTP 404)."
-                else:
-                    last_error = f"Request rejected (HTTP {code}): {msg[:120]}"
-                break                                  # next model
+                last_error = ("Free-tier quota reached (HTTP 429)." if code == 429 else
+                              f"Model '{model}' not available (HTTP 404)." if code == 404 else
+                              f"Request rejected (HTTP {code}): {msg[:120]}")
+                break
             except errors.ServerError as e:
                 attempts.append((model, f"server {getattr(e, 'code', '')}"))
                 last_error = f"Gemini server error (HTTP {getattr(e, 'code', '5xx')})."
@@ -183,7 +189,7 @@ def call_gemini(api_key: str, system: str, contents, models: list[str], json_sch
                     time.sleep(1.5)
                     continue
                 break
-            except Exception as e:                     # timeouts, network, DNS...
+            except Exception as e:  # noqa: BLE001 - timeouts, network, DNS...
                 attempts.append((model, type(e).__name__))
                 last_error = f"Network/timeout problem: {type(e).__name__}."
                 if attempt == 0:
@@ -193,21 +199,6 @@ def call_gemini(api_key: str, system: str, contents, models: list[str], json_sch
     return AIResult(ok=False, source="rule-based", error=last_error, attempts=attempts)
 
 
-def get_recommendation(api_key: str, context: dict, models: list[str]) -> AIResult:
-    user = RECOMMENDER_USER_TEMPLATE.format(data_json=to_json(context))
-    res = call_gemini(api_key, RECOMMENDER_SYSTEM, user, models, json_schema=Recommendation, temperature=0.2, max_tokens=4096)
-    if not res.ok:
-        return res
-    try:
-        parsed = Recommendation.model_validate_json(_strip_fences(res.text)).model_dump()
-        res.parsed = parsed
-    except (ValidationError, ValueError) as e:
-        res.ok = False
-        res.source = "rule-based"
-        res.error = f"AI returned output that does not match the expected format ({type(e).__name__})."
-    return res
-
-
 def _strip_fences(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
@@ -215,10 +206,72 @@ def _strip_fences(text: str) -> str:
     return t
 
 
-# ---------------------------------------------------------------- output checks
-def _numbers(text: str) -> list[float]:
-    text = ID_PATTERN.sub(" ", text)                 # vendor IDs are not numbers
-    text = re.sub(r"ISO\s?\d+", " ", text)           # nor are ISO standard numbers
+def _parse(res: AIResult, model_cls) -> AIResult:
+    if not res.ok:
+        return res
+    try:
+        res.parsed = model_cls.model_validate_json(_strip_fences(res.text)).model_dump()
+    except (ValidationError, ValueError) as e:
+        res.ok, res.source = False, "rule-based"
+        res.error = f"AI returned output that does not match the expected format ({type(e).__name__})."
+    return res
+
+
+# ---------------------------------------------------------------- 1+2: explore, then judge
+def explore(api_key: str, profile_llm: dict, models: list[str]) -> AIResult:
+    user = EXPLORER_USER.format(profile_json=to_json(profile_llm))
+    return _parse(call_gemini(api_key, EXPLORER_SYSTEM, user, models, json_schema=DataPlan,
+                              temperature=0.2, max_tokens=8192), DataPlan)
+
+
+def judge(api_key: str, profile_llm: dict, plan: dict, models: list[str]) -> AIResult:
+    user = JUDGE_USER.format(profile_json=to_json(profile_llm), plan_json=to_json(plan))
+    return _parse(call_gemini(api_key, JUDGE_SYSTEM, user, models, json_schema=Verdict,
+                              temperature=0.1, max_tokens=8192), Verdict)
+
+
+def explore_and_judge(api_key: str, profile_llm: dict, models: list[str]) -> dict:
+    """Returns {'plan', 'explorer', 'judge', 'note'}; plan is None if the explorer failed."""
+    ex = explore(api_key, profile_llm, models)
+    if not ex.ok:
+        return {"plan": None, "explorer": ex, "judge": None, "note": ex.error}
+    plan = dict(ex.parsed, source="gemini explorer")
+    jd = judge(api_key, profile_llm, ex.parsed, models)
+    if not jd.ok:
+        return {"plan": plan, "explorer": ex, "judge": jd,
+                "note": f"Judge unavailable ({jd.error}) - explorer plan used without review."}
+    v = jd.parsed
+    corrected = v.get("corrected_plan") or {}
+    if corrected.get("criteria"):
+        plan = dict(corrected, source=f"gemini explorer + judge ({v.get('verdict')})")
+    return {"plan": plan, "explorer": ex, "judge": jd, "note": ""}
+
+
+# ---------------------------------------------------------------- IDs in model output
+def id_regex(ids) -> re.Pattern | None:
+    """Build a pattern that matches IDs of the same SHAPE as the real ones (to catch invented IDs)."""
+    ids = [str(i) for i in ids if str(i)]
+    if not ids:
+        return None
+    m = [re.fullmatch(r"([A-Za-z]{1,8})([-_ ]?)(\d{1,9})", i) for i in ids]
+    if all(m):
+        prefixes = sorted({x.group(1) for x in m}, key=len, reverse=True)
+        return re.compile(r"\b(?:" + "|".join(map(re.escape, prefixes)) + r")[-_ ]?\d{1,9}\b")
+    return None
+
+
+def mentioned_ids(text: str, known: set, pattern: re.Pattern | None) -> tuple[set, set]:
+    """Returns (known ids mentioned, unknown id-shaped tokens)."""
+    if pattern is not None:
+        found = set(pattern.findall(text))
+        return found & known, found - known
+    return {k for k in list(known)[:500] if k and k in text}, set()
+
+
+def _numbers(text: str, pattern: re.Pattern | None) -> list[float]:
+    if pattern is not None:
+        text = pattern.sub(" ", text)
+    text = re.sub(r"ISO\s?\d+", " ", text)
     vals = []
     for m in re.findall(r"-?\d[\d,]*(?:\.\d+)?", text):
         try:
@@ -228,51 +281,47 @@ def _numbers(text: str) -> list[float]:
     return vals
 
 
-def validate_recommendation(parsed: dict, context: dict, top_id: str) -> tuple[list[dict], float | None]:
+# ---------------------------------------------------------------- 3: analyst
+def get_insights(api_key: str, context: dict, models: list[str]) -> AIResult:
+    user = ANALYST_USER.format(data_json=to_json(context))
+    return _parse(call_gemini(api_key, ANALYST_SYSTEM, user, models, json_schema=Insights,
+                              temperature=0.2, max_tokens=6144), Insights)
+
+
+def validate_insights(parsed: dict, context: dict, pool_ids: set, top_id: str) -> list[dict]:
     """Hallucination checks run on every AI answer before it is shown."""
+    pattern = id_regex(pool_ids)
     checks = []
-    qualified_ids = {v["vendor_id"] for v in context["qualified_vendors"]}
-    known_ids = qualified_ids | {v["vendor_id"] for v in context["disqualified_vendors"]}
-
-    rec = parsed.get("recommended_vendor_id", "")
-    checks.append({"check": "Recommended vendor exists in qualified list",
-                   "passed": rec in qualified_ids, "detail": rec or "(blank)"})
-    checks.append({"check": "Agrees with transparent score model",
-                   "passed": rec == top_id,
+    rec = parsed.get("recommended_id", "")
+    checks.append({"check": "Recommended option exists in the ranked pool", "passed": rec in pool_ids, "detail": rec or "(blank)"})
+    checks.append({"check": "Agrees with transparent score model", "passed": rec == top_id,
                    "detail": "Same #1" if rec == top_id else f"AI says {rec}, model says {top_id} - model ranking is used"})
-
-    all_text = " ".join([parsed.get("headline", ""), parsed.get("l1_comparison", ""), parsed.get("disagreement_note", "")]
-                        + parsed.get("why", []) + parsed.get("negotiation_levers", [])
-                        + [r.get("risk", "") + " " + r.get("vendor_id", "") for r in parsed.get("risks", [])])
-    mentioned = set(ID_PATTERN.findall(all_text))
-    unknown = sorted(mentioned - known_ids)
-    checks.append({"check": "No invented vendor IDs", "passed": not unknown,
-                   "detail": "OK" if not unknown else "Unknown IDs: " + ", ".join(unknown)})
-
+    parts = [parsed.get("headline", ""), parsed.get("disagreement_note", "")]
+    for k in ("why", "trade_offs", "anomalies", "negotiation_levers", "further_analysis"):
+        parts += parsed.get(k, [])
+    parts += [r.get("risk", "") + " " + r.get("id", "") for r in parsed.get("risks", [])]
+    text = " ".join(parts)
+    _, unknown = mentioned_ids(text, set(pool_ids), pattern)
+    bad_risk_ids = [r.get("id") for r in parsed.get("risks", []) if r.get("id") not in pool_ids]
+    unknown |= set(x for x in bad_risk_ids if x)
+    checks.append({"check": "No invented option IDs", "passed": not unknown,
+                   "detail": "OK" if not unknown else "Unknown: " + ", ".join(sorted(unknown)[:5])})
     checks.append({"check": "Confidence label is valid", "passed": parsed.get("confidence") in {"High", "Medium", "Low"},
                    "detail": parsed.get("confidence", "")})
-
-    echo = looks_like_injection(all_text)
+    echo = looks_like_injection(text)
     checks.append({"check": "No injected instructions echoed", "passed": not echo,
                    "detail": "OK" if not echo else "Output repeats instruction-like text"})
-
-    # Numeric grounding: every number the AI quotes should exist in the data we sent.
-    source_nums = _numbers(to_json(context))
-    claimed = [n for n in _numbers(all_text) if not (float(n).is_integer() and 0 <= n <= 3)]
-    grounded = 0
-    for n in claimed:
-        if any(abs(n - s) <= max(0.05, 0.01 * abs(s)) or abs(abs(n) - abs(s)) <= 0.05 for s in source_nums):
-            grounded += 1
+    source = _numbers(to_json(context), pattern)
+    claimed = [n for n in _numbers(text, pattern) if not (float(n).is_integer() and 0 <= n <= 5)]
+    grounded = sum(any(abs(n - s) <= max(0.05, 0.01 * abs(s)) or abs(abs(n) - abs(s)) <= 0.05 for s in source) for n in claimed)
     ratio = grounded / len(claimed) if claimed else None
-    checks.append({"check": "Numbers traceable to data",
-                   "passed": ratio is None or ratio >= 0.8,
+    checks.append({"check": "Numbers traceable to data", "passed": ratio is None or ratio >= 0.8,
                    "detail": "No numbers quoted" if ratio is None else f"{grounded}/{len(claimed)} numbers found in the data"})
-    return checks, ratio
+    return checks
 
 
 # ---------------------------------------------------------------- chat
 def screen_user_message(msg: str) -> tuple[bool, str]:
-    """Checks that run BEFORE any API call. Returns (allowed, reply_if_blocked)."""
     if not msg or not msg.strip():
         return False, "Please type a question."
     if len(msg) > MAX_CHAT_CHARS:
@@ -283,50 +332,62 @@ def screen_user_message(msg: str) -> tuple[bool, str]:
 
 
 def chat_reply(api_key: str, context: dict, history: list[dict], user_msg: str, models: list[str]) -> AIResult:
-    top_id = context["qualified_vendors"][0]["vendor_id"] if context["qualified_vendors"] else "V001"
-    system = CHAT_SYSTEM.replace("{top_id}", top_id).replace("{data_json}", to_json(context))
+    top = context["top_options"][0]["id"] if context.get("top_options") else "the top option"
+    system = CHAT_SYSTEM.replace("{top_id}", str(top)).replace("{data_json}", to_json(context))
     turns = history[-MAX_HISTORY_TURNS:] + [{"role": "user", "content": user_msg}]
     contents = [{"role": "user" if t["role"] == "user" else "model", "parts": [{"text": t["content"]}]} for t in turns]
     return call_gemini(api_key, system, contents, models, temperature=0.2, max_tokens=2048)
 
 
-def offline_answer(question: str, scored: pd.DataFrame) -> str:
-    """Keyword fallback when the AI is unavailable. Deterministic and grounded."""
+_ROLE_KEYWORDS = [
+    (("cheap", "price", "cost", "l1", "lowest rate", "expensive"), "cost"),
+    (("fast", "quick", "lead", "urgent", "soon", "delivery", "on time", "on-time", "otif"), "delivery"),
+    (("quality", "defect", "reject", "rating", "audit"), "quality"),
+    (("risk", "safe", "complaint"), "risk"),
+    (("credit", "payment", "working capital"), "financial"),
+    (("esg", "sustain", "green", "certif", "iso"), "sustainability"),
+    (("capacity", "volume", "moq", "scale"), "capacity"),
+]
+
+
+def offline_answer(question: str, scored: pd.DataFrame, criteria: list[dict]) -> str:
+    """Keyword fallback when the AI is unavailable. Deterministic, grounded, works for any criteria."""
     if scored.empty:
-        return "No vendor qualifies with the current requirements, so there is nothing to compare."
+        return "No option qualifies with the current filters, so there is nothing to compare."
     q = question.lower()
-    pick = None
-    rules = [
-        (("cheap", "lowest price", "l1", "cost", "price"), "landed_cost", True, "lowest landed cost", "Rs/kg"),
-        (("fast", "quick", "lead time", "urgent", "soon"), "lead_time_days", True, "shortest lead time", "days"),
-        (("reliab", "on time", "otif", "deliver"), "otif_pct", False, "best on-time delivery", "%"),
-        (("quality", "qc", "reject"), "qc_pass_rate_pct", False, "best QC pass rate", "%"),
-        (("credit", "payment", "working capital"), "credit_days", False, "longest credit period", "days"),
-        (("esg", "sustain", "green"), "esg_score", False, "best ESG score", "/100"),
-    ]
-    for keys, col, asc, label, unit in rules:
-        if any(k in q for k in keys):
-            r = scored.sort_values(col, ascending=asc).iloc[0]
-            val = f"{r[col]:.2f}" if col == "landed_cost" else f"{r[col]:g}"
-            pick = f"{r['vendor_id']} ({r['vendor_name']}) has the {label}: {val}{'' if unit in ('%', '/100') else ' '}{unit}."
-            break
-    if pick is None and any(k in q for k in ("best", "top", "recommend", "first", "rank")):
+    target = next((c for c in criteria if c["label"].lower() in q or c["column"].replace("_", " ") in q), None)
+    if target is None:
+        for words, role in _ROLE_KEYWORDS:
+            if any(w in q for w in words):
+                target = next((c for c in sorted(criteria, key=lambda c: -c["weight"]) if c.get("role") == role), None)
+                if target:
+                    break
+    if target is not None:
+        col = ccol(target)
+        r = scored.loc[scored[col].idxmin() if target["direction"] == "lower" else scored[col].idxmax()]
+        name = f" ({r['_label']})" if str(r["_label"]) != str(r["_id"]) else ""
+        return (f"{r['_id']}{name} is best on {target['label']}: {r[col]:g} "
+                f"({'lower' if target['direction'] == 'lower' else 'higher'} is better).  _(Offline rule-based answer - AI unavailable.)_")
+    if any(k in q for k in ("best", "top", "recommend", "first", "rank", "why")):
         r = scored.iloc[0]
-        pick = f"{r['vendor_id']} ({r['vendor_name']}) is ranked #1 with a score of {r['score']:.1f}/100."
-    if pick is None:
-        return ("AI assistant is offline, so I can only answer simple questions. Try: "
-                "'cheapest', 'fastest', 'most reliable', 'best quality', 'longest credit' or 'who is ranked first'.")
-    return pick + "  _(Offline rule-based answer - AI assistant unavailable.)_"
+        return f"{r['_id']} is ranked #1 with a score of {r['score']:.1f}/100.  _(Offline rule-based answer - AI unavailable.)_"
+    labels = ", ".join(c["label"] for c in criteria[:5])
+    return f"AI assistant is offline, so I can only answer simple questions such as 'who is best on {criteria[0]['label']}?' or 'who is ranked first?'. Criteria: {labels}."
 
 
-def label_ids(text: str, id_to_name: dict) -> str:
-    """Show vendor names next to IDs on screen (names are never sent to the AI when anonymised)."""
+def label_ids(text: str, id_to_name: dict, pattern: re.Pattern | None) -> str:
+    """Show names next to IDs on screen (names are not sent to the AI when anonymising)."""
+    if not id_to_name:
+        return text
     seen = set()
 
     def repl(m):
         vid = m.group(0)
-        if vid in id_to_name and vid not in seen and id_to_name[vid] not in text:
+        name = id_to_name.get(vid)
+        if name and name != vid and vid not in seen and name not in text:
             seen.add(vid)
-            return f"{vid} ({id_to_name[vid]})"
+            return f"{vid} ({name})"
         return vid
-    return ID_PATTERN.sub(repl, text)
+    if pattern is not None:
+        return pattern.sub(repl, text)
+    return text
