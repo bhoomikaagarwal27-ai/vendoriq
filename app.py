@@ -20,6 +20,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import aggregate
 import ai_engine as ai
 import analysis
 import ingest
@@ -89,6 +90,14 @@ def build_dataset(key: str, _tables: list, strategy: str, join_key: str | None):
     comb = ingest.combine(_tables, strategy, join_key)
     prof = profiler.profile_table(comb.df, comb.originals)
     return comb, prof
+
+
+@st.cache_resource(show_spinner=False, max_entries=6)
+def aggregate_dataset(key: str, vendor_col: str, _comb, _prof):
+    """Transaction rows -> one row per vendor."""
+    df, headers, alog = aggregate.aggregate_table(_comb.df, vendor_col, _comb.originals, _prof)
+    comb = ingest.CombineResult(df, headers, _comb.strategy, vendor_col, _comb.log + alog)
+    return comb, profiler.profile_table(comb.df, comb.originals)
 
 
 @st.cache_resource(show_spinner=False, max_entries=12)
@@ -216,8 +225,11 @@ with tab_data:
         strategy, join_key = "auto", None
         if len(tables) > 1:
             c1, c2 = st.columns([2, 2])
-            strategy = c1.radio("How should the files be combined?", ["auto", "stack", "join"], horizontal=True,
-                                format_func={"auto": "Auto-detect", "stack": "Stack (append rows)", "join": "Join (match on a key)"}.get)
+            strategy = c1.radio("How should the files be combined?", ["auto", "stack", "join", "aggregate_join", "largest"], horizontal=True,
+                                format_func={"auto": "Auto-detect", "stack": "Stack (append rows)", "join": "Join (match on a key)",
+                                             "aggregate_join": "Summarise per vendor, then join", "largest": "Use the largest file only"}.get,
+                                help="Auto: same columns → stack; a unique shared key → join; transaction files sharing a vendor column "
+                                     "→ summarise each per vendor and join; nothing in common → largest file only.")
             if strategy == "join":
                 normed = [profiler.normalise_columns(t.df)[0] for t in tables]
                 keys = ingest.find_join_keys(normed)
@@ -229,6 +241,24 @@ with tab_data:
         dataset_key = f"{fp}|{strategy}|{join_key}"
         with st.spinner("Combining and profiling the data…"):
             comb, profile = build_dataset(dataset_key, tables, strategy, join_key)
+        vendor_col = aggregate.suggest_key(comb.df, profile)
+        if vendor_col:
+            n_v = comb.df[vendor_col].nunique()
+            hdr = {p["column"]: p["original_header"] for p in profile}
+            agg_on = st.toggle(f"Rows are transactions ({len(comb.df):,} rows for {n_v:,} vendors) → summarise to one row per vendor",
+                               value=True, key=f"agg_{dataset_key}",
+                               help="Quantities and money are summed, prices / rates / scores averaged, lead-time and credit days derived "
+                                    "from date pairs, code columns (store no., brand code, PO no.) dropped.")
+            if agg_on:
+                cols_v = [p["column"] for p in profile if aggregate.is_vendor_like(p["column"]) and p["kind"] not in ("empty", "constant")]
+                vendor_col = st.selectbox("Vendor column", cols_v, index=cols_v.index(vendor_col), format_func=lambda c: hdr.get(c, c),
+                                          key=f"aggcol_{dataset_key}") if len(cols_v) > 1 else vendor_col
+                with st.spinner("Summarising per vendor…"):
+                    comb, profile = aggregate_dataset(f"{dataset_key}|agg|{vendor_col}", vendor_col, comb, profile)
+                dataset_key = f"{dataset_key}|agg|{vendor_col}"
+        elif not any(aggregate.is_vendor_like(p["column"]) for p in profile):
+            st.info("No vendor / supplier column was found, so each ROW is treated as one option. "
+                    "If your rows are products, stores or orders, add a vendor column or upload the file that has one.", icon="ℹ️")
         for line in comb.log:
             st.caption("• " + line)
         header_of = {p["column"]: p["original_header"] for p in profile}
@@ -523,7 +553,20 @@ with tab_rank:
             f"**{icon} {decision[0]}** — {decision[1]}")
 
         if scored.empty:
-            st.markdown("**No option passes the filters.** Excluded options and reasons:")
+            st.markdown("**No option passes.** Why the options were excluded:")
+            rc = excluded["_excluded_reason"].str.replace(r"[\d.,]+", "#", regex=True).value_counts().head(5)
+            st.dataframe(rc.rename("options").rename_axis("reason").reset_index(), hide_index=True, width="stretch")
+            tips = []
+            if excluded["_excluded_reason"].str.contains("more than half").any():
+                tips.append("Many criteria are empty for these rows - untick sparse criteria in tab ②, or check the file-combine option in tab ① "
+                            "(unrelated files should not be stacked).")
+            if excluded["_excluded_reason"].str.contains("min|max").any():
+                tips.append("A Min/Max limit in tab ② removes everything - clear or relax it.")
+            if excluded["_excluded_reason"].str.contains("major criterion").any():
+                tips.append("A heavily weighted criterion is blank for these rows - lower its weight or untick it in tab ②.")
+            for t_ in tips:
+                st.info(t_, icon="💡")
+            st.markdown("Excluded options:")
             st.dataframe(excluded[["_id", "_label", "_excluded_reason"]].head(50), hide_index=True, width="stretch")
         else:
             top = scored.iloc[0]

@@ -94,11 +94,15 @@ def heuristic_plan(profile: list[dict]) -> dict:
                 direction, sure = "lower", True
             if p["kind"] == "date":          # dates become "age in days": more recent is better
                 direction, sure, role = "lower", True, "other"
+            weight = ROLE_WEIGHT[role]
+            if c.endswith("_total") or c.startswith("records"):
+                weight = 5          # summed totals / record counts mostly reflect business volume, not performance
             criteria.append({"column": c, "label": _pretty(p) + (" (age, days)" if p["kind"] == "date" else ""), "direction": direction,
-                             "weight": ROLE_WEIGHT[role], "role": role,
+                             "weight": weight, "role": role,
                              "reason": "keyword rule" + ("" if sure else " (direction guessed - please check)")})
         else:
-            why = {"text": "free text", "name": "name/label column", "id": "identifier", "constant": "same value in every row",
+            why = {"text": "free text", "name": "name/label column", "id": "identifier", "code": "code number (names something, does not measure it)",
+                   "constant": "same value in every row",
                    "empty": "no data", "categorical": "category (usable as filter or group)"}.get(p["kind"], p["kind"])
             if p["kind"] in NUMERIC_KINDS:
                 why = f"{p['missing_pct']}% missing"

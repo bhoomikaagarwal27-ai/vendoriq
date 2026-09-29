@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from profiler import NA_STRINGS, normalise_columns
+import aggregate
+from profiler import NA_STRINGS, normalise_columns, profile_table
 
 MAX_TOTAL_ROWS = 500_000        # protects memory on the free hosting tier; larger data is sampled
 MAX_FILES = 20
@@ -137,6 +138,24 @@ def find_join_keys(tables: list[pd.DataFrame]) -> list[str]:
     return keys
 
 
+def find_vendor_key(tables: list[pd.DataFrame]) -> tuple[str | None, list[int]]:
+    """A vendor-like column (vendor_name, supplier_code …) shared by at least 2 tables."""
+    counts: dict[str, list[int]] = {}
+    for i, t in enumerate(tables):
+        for c in t.columns:
+            if aggregate.is_vendor_like(c):
+                counts.setdefault(c, []).append(i)
+    cands = [(c, idx) for c, idx in counts.items() if len(idx) >= 2]
+    if not cands:
+        return None, []
+    cands.sort(key=lambda x: (-len(x[1]), 0 if "name" in x[0] else 1, x[0]))
+    return cands[0]
+
+
+def _stem(name: str) -> str:
+    return normalise_columns(pd.DataFrame(columns=[name.split(".")[0]]))[0].columns[0][:20]
+
+
 def combine(tables: list[Table], strategy: str = "auto", key: str | None = None) -> CombineResult:
     log: list[str] = []
     if not tables:
@@ -158,17 +177,59 @@ def combine(tables: list[Table], strategy: str = "auto", key: str | None = None)
         colsets = [set(d.columns) for d in normed]
         similar = min(_jaccard(a, b) for i, a in enumerate(colsets) for b in colsets[i + 1:]) >= 0.6
         keys = find_join_keys(normed)
+        vkey, vidx = find_vendor_key(normed)
         if strategy == "auto":
-            strategy = "stack" if similar else ("join" if keys else "stack")
-            log.append(f"Auto-detected strategy: {strategy.upper()} "
-                       + ("(files share most columns)." if similar else
-                          f"(shared key '{keys[0]}')." if keys else "(no shared key; columns were unioned)."))
+            if similar:
+                strategy = "stack"
+                log.append("Auto-detected strategy: STACK (files share most columns).")
+            elif keys:
+                strategy = "join"
+                log.append(f"Auto-detected strategy: JOIN (shared key '{keys[0]}').")
+            elif vkey:
+                strategy = "aggregate_join"
+                log.append(f"Auto-detected strategy: SUMMARISE PER VENDOR, THEN JOIN on '{vkey}' "
+                           "(files are transaction lists that share a vendor column).")
+            else:
+                strategy = "largest"
+                log.append("The files have no columns in common, so they cannot be combined safely. "
+                           "Only the largest file is used - choose another strategy above if needed.")
+        if strategy == "aggregate_join" and not vkey:
+            log.append("No vendor column is shared by the files - using the largest file only.")
+            strategy = "largest"
+        if strategy == "largest":
+            i = max(range(len(normed)), key=lambda j: len(normed[j]))
+            df = normed[i]
+            log.append(f"Using {tables[i].name}: {len(df):,} rows x {df.shape[1]} columns.")
+        elif strategy == "aggregate_join":
+            key = vkey
+            parts = []
+            for i in vidx:
+                prof = profile_table(normed[i], originals)
+                agg, headers, alog = aggregate.aggregate_table(normed[i], vkey, originals, prof)
+                stem = _stem(tables[i].name)
+                ren = {c: f"{c}_{stem}" for c in agg.columns if c != vkey and any(c in p.columns for p in parts)}
+                ren.update({"records": f"records_{stem}"})
+                agg = agg.rename(columns=ren)
+                originals.update({ren.get(c, c): (h if c not in ren else f"{h} [{tables[i].name}]") for c, h in headers.items()})
+                originals[f"records_{stem}"] = f"Number of records [{tables[i].name}]"
+                log.append(f"{tables[i].name}: {len(normed[i]):,} rows → {len(agg):,} vendors.")
+                parts.append(agg)
+            df = parts[0]
+            for p in parts[1:]:
+                before = set(df[vkey])
+                df = df.merge(p, on=vkey, how="outer")
+                log.append(f"Joined on '{vkey}': {len(before & set(p[vkey])):,} vendors appear in both files.")
+            left_out = [tables[i].name for i in range(len(tables)) if i not in vidx]
+            if left_out:
+                log.append("Not used (no vendor column, so it cannot be linked to vendors): " + ", ".join(left_out) + ".")
         if strategy == "join":
             key = key if key in (keys or []) else (keys[0] if keys else None)
             if key is None:
                 log.append("No usable join key found - falling back to STACK.")
                 strategy = "stack"
-        if strategy == "stack":
+        if strategy in ("largest", "aggregate_join"):
+            pass
+        elif strategy == "stack":
             parts = []
             for t, d in zip(tables, normed):
                 d = d.copy()

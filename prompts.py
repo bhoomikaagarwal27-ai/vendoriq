@@ -20,7 +20,7 @@ WHY EACH RULE EXISTS (rule -> risk it defends against)
 - "no new arithmetic"                    -> LLMs are unreliable at maths; Python pre-computes everything
 """
 
-PROMPT_VERSION = "v2.0"
+PROMPT_VERSION = "v2.1"
 
 EXPLORER_SYSTEM = """You are a senior procurement data analyst (an AI). A user uploaded a table of OPTIONS
 (usually vendors or suppliers, but it can be any list of things to compare). You receive a PROFILE of the
@@ -40,6 +40,10 @@ HOW TO DECIDE
     weight 0-100 reflecting typical procurement importance (cost and quality usually highest),
     role: cost | quality | delivery | risk | financial | sustainability | capacity | other,
     a short reason.
+- If the table was summarised per vendor: columns ending "_avg" are averages per vendor, "_total" are sums
+  (business volume - usually low weight, they favour big vendors), "records" counts rows, and "lead_time_days_…"
+  / "credit_days_…" were derived from date pairs (strong criteria). Prefer rates and per-unit measures over totals.
+- Columns of kind "code" are code numbers (store no., brand code, PO no.) - never criteria.
 - Never use as a criterion: IDs, names, phone numbers, PIN codes, row numbers, free text, or a column
   that looks like the RESULT of an earlier decision (e.g. "selected", "final_rank").
 - ignored_columns: every column you did not use, with a short reason.

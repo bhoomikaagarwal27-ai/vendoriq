@@ -43,6 +43,21 @@ GROUP_HINTS = ("material", "category", "product", "item", "commodity", "segment"
                "class", "group", "family", "grade")
 
 
+CODE_TOKENS = {"id", "code", "no", "num", "number", "nbr", "sku", "zip", "pin", "pincode", "phone", "mobile",
+               "po", "invoice", "ref", "key", "gstin", "pan", "hsn"}
+ENTITY_TOKENS = {"store", "brand", "vendor", "supplier", "item", "product", "class", "classification", "category",
+                 "branch", "plant", "warehouse", "location", "dept", "department", "region", "customer", "party",
+                 "inventory", "sap", "material", "site", "outlet", "shop", "account", "batch", "lot"}
+
+
+def looks_like_code(col: str) -> bool:
+    """Integer columns that NAME things rather than MEASURE them: store no., brand code, PO number."""
+    toks = [t for t in str(col).lower().split("_") if t]
+    if not toks:
+        return False
+    return toks[-1] in CODE_TOKENS or set(toks) <= (ENTITY_TOKENS | CODE_TOKENS)
+
+
 def has_token(col: str, tokens) -> bool:
     """Whole-word match on snake_case names: 'vendor_id' has 'id'; 'notes' does not have 'no'."""
     parts = set(str(col).lower().split("_"))
@@ -51,7 +66,9 @@ def has_token(col: str, tokens) -> bool:
 
 # ---------------------------------------------------------------- header helpers
 def normalise_name(name: str) -> str:
-    s = str(name).strip().lower()
+    s = str(name).strip()
+    # split camelCase / PascalCase: "VendorNumber" -> "vendor_number", "PONumber" -> "po_number", "onHand" -> "on_hand"
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", s).lower()
     s = s.replace("%", " pct ").replace("₹", " inr ").replace("$", " usd ").replace("#", " no ")
     s = re.sub(r"[^0-9a-z]+", "_", s).strip("_")
     if not s:
@@ -135,7 +152,9 @@ def parse_dates(s: pd.Series) -> pd.Series | None:
     t = _clean_text(s).dropna()
     if t.empty or not t.str.contains(r"\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}|\d{4}-\d{2}", regex=True).mean() > 0.8:
         return None
-    parsed = pd.to_datetime(_clean_text(s), errors="coerce", dayfirst=True, format="mixed")
+    txt = _clean_text(s)
+    iso = txt.dropna().str.match(r"^\s*\d{4}-\d{1,2}-\d{1,2}").mean() >= 0.8
+    parsed = pd.to_datetime(txt, errors="coerce", dayfirst=not iso, format="ISO8601" if iso else "mixed")
     return parsed if parsed.notna().mean() >= 0.8 * max(s.notna().mean(), 1e-9) else None
 
 
@@ -198,7 +217,10 @@ def profile_column(name: str, s: pd.Series, original: str, n_rows: int) -> dict:
             info["date_range"] = [str(dates.min().date()), str(dates.max().date())]
         elif parse_rate >= 0.7:
             is_int_like = bool(((num.dropna() % 1) == 0).all())
-            kind = "id" if (is_int_like and info["unique_ratio"] >= 0.9 and has_token(name, ID_NAME_HINTS)) else "numeric"
+            if is_int_like and looks_like_code(name):
+                kind = "id" if info["unique_ratio"] >= 0.9 else "code"
+            else:
+                kind = "numeric"
             info["parse_rate"] = round(parse_rate, 3)
         else:
             avg_len = float(vals.astype(str).str.len().mean())
@@ -219,7 +241,7 @@ def profile_column(name: str, s: pd.Series, original: str, n_rows: int) -> dict:
                 info.update(min=_r(nv.min()), p25=_r(nv.quantile(.25)), median=_r(nv.median()),
                             p75=_r(nv.quantile(.75)), max=_r(nv.max()), std=_r(nv.std()))
             info["unit_hint"] = _unit_hint(s, original)
-        if kind in ("categorical", "boolean", "ordinal"):
+        if kind in ("categorical", "boolean", "ordinal", "code"):
             info["top_values"] = {str(k): int(v) for k, v in vals.astype(str).value_counts().head(6).items()}
     info["kind"] = kind
     info["examples"] = [str(x)[:40] for x in vals.astype(str).drop_duplicates().head(3).tolist()]
