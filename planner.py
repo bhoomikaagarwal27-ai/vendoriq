@@ -43,7 +43,14 @@ ROLE_WORDS = [  # order matters: specific words first ("pass_rate" is quality, n
     ("cost", ("price", "cost", "rate", "fee", "charge", "tariff", "freight", "amount", "inr", "usd", "discount")),
 ]
 ROLE_WEIGHT = {"cost": 25, "quality": 20, "delivery": 18, "risk": 12, "financial": 10,
-               "sustainability": 6, "capacity": 6, "other": 5}
+               "sustainability": 6, "capacity": 6, "other": 5, "volume": 0}
+ROLES = tuple(ROLE_WEIGHT)
+
+
+def is_volume(col: str) -> bool:
+    """Summed totals and record counts measure how MUCH business a vendor did, not how GOOD it is.
+    Used as criteria they always favour the biggest vendor, whatever the other weights."""
+    return col.endswith("_total") or col.startswith("records")
 MAX_CRITERIA = 12
 
 
@@ -67,6 +74,17 @@ def guess_role(col: str) -> str:
     return "other"
 
 
+def role_of(c: dict, col: str) -> str:
+    """Normalise a role from the AI ('Cost', 'price', 'Quality metric' ...) to one of ROLES."""
+    r = str(c.get("role") or "").strip().lower()
+    if r in ROLES:
+        return r
+    for role in ROLES:
+        if role in r:
+            return role
+    return "volume" if is_volume(col) else guess_role(col)
+
+
 def _pretty(p: dict) -> str:
     return str(p.get("original_header") or p["column"]).strip()[:40]
 
@@ -82,7 +100,7 @@ def heuristic_plan(profile: list[dict]) -> dict:
     groups = [p for p in profile if p["kind"] == "categorical" and 2 <= p["unique"] <= 40
               and has_token(p["column"], GROUP_HINTS)]
     group = groups[0]["column"] if groups else ""
-    criteria, ignored = [], []
+    criteria, ignored, unclear = [], [], []
     for p in profile:
         c = p["column"]
         if c in (entity, label, group):
@@ -94,12 +112,17 @@ def heuristic_plan(profile: list[dict]) -> dict:
                 direction, sure = "lower", True
             if p["kind"] == "date":          # dates become "age in days": more recent is better
                 direction, sure, role = "lower", True, "other"
-            weight = ROLE_WEIGHT[role]
-            if c.endswith("_total") or c.startswith("records"):
-                weight = 5          # summed totals / record counts mostly reflect business volume, not performance
-            criteria.append({"column": c, "label": _pretty(p) + (" (age, days)" if p["kind"] == "date" else ""), "direction": direction,
-                             "weight": weight, "role": role,
-                             "reason": "keyword rule" + ("" if sure else " (direction guessed - please check)")})
+            lbl = _pretty(p) + (" (age, days)" if p["kind"] == "date" else "")
+            if is_volume(c):
+                ignored.append({"column": c, "reason": "volume measure (favours the biggest vendor) - tick only if size matters"})
+                continue
+            if not sure:
+                unclear.append({"column": c, "label": lbl, "direction": direction, "weight": ROLE_WEIGHT[role], "role": role,
+                                "reason": "keyword rule (direction guessed - please check)"})
+                ignored.append({"column": c, "reason": "better-direction unclear - tick and set 'Better' if relevant"})
+                continue
+            criteria.append({"column": c, "label": lbl, "direction": direction,
+                             "weight": ROLE_WEIGHT[role], "role": role, "reason": "keyword rule"})
         else:
             why = {"text": "free text", "name": "name/label column", "id": "identifier", "code": "code number (names something, does not measure it)",
                    "constant": "same value in every row",
@@ -107,6 +130,9 @@ def heuristic_plan(profile: list[dict]) -> dict:
             if p["kind"] in NUMERIC_KINDS:
                 why = f"{p['missing_pct']}% missing"
             ignored.append({"column": c, "reason": why})
+    if not criteria:                     # nothing clear-cut: fall back to the guessed ones rather than nothing
+        criteria = unclear
+        ignored = [i for i in ignored if i["column"] not in {u["column"] for u in unclear}]
     criteria = sorted(criteria, key=lambda x: -x["weight"])[:MAX_CRITERIA]
     return {"source": "heuristic", "dataset_summary": f"Table with {len(profile)} columns; plan built by keyword rules (AI not used).",
             "entity_column": entity or "", "label_column": label or entity or "", "group_column": group,
@@ -228,7 +254,7 @@ def validate_plan(plan: dict, profile: list[dict]) -> tuple[dict, list[str]]:
             w = 0.0
         w = min(max(w, 0.0), 100.0)
         crit.append({"column": col, "label": str(c.get("label") or col)[:40], "direction": direction, "weight": w,
-                     "role": c.get("role") or guess_role(col), "reason": str(c.get("reason", ""))[:200]})
+                     "role": role_of(c, col), "reason": str(c.get("reason", ""))[:200]})
         seen.add(col)
     if not crit:
         log.append("No valid criteria in the plan - the keyword plan's criteria are used instead.")

@@ -388,7 +388,7 @@ with tab_plan:
                          "weight": float(c["weight"]) if c else 0.0,
                          "min allowed": pd.to_numeric(fmin.get(col), errors="coerce"),
                          "max allowed": pd.to_numeric(fmax.get(col), errors="coerce"),
-                         "role": c.get("role", "other") if c else planner.guess_role(col),
+                         "role": planner.role_of(c, col) if c else ("volume" if planner.is_volume(col) else planner.guess_role(col)),
                          "why": (c.get("reason", "") if c else ignored.get(col, "not in plan"))[:120],
                          "range in data": f"{fmt(p.get('min'))} … {fmt(p.get('max'))}" if p else "derived"})
         if not rows:
@@ -406,8 +406,8 @@ with tab_plan:
                 "weight": st.column_config.NumberColumn("Weight", min_value=0, max_value=100, step=1, width="small"),
                 "min allowed": st.column_config.NumberColumn("Min allowed", help="Knock out options below this value (any number)."),
                 "max allowed": st.column_config.NumberColumn("Max allowed", help="Knock out options above this value (any number)."),
-                "role": st.column_config.SelectboxColumn("Role", options=["cost", "quality", "delivery", "risk", "financial",
-                                                                          "sustainability", "capacity", "other"], width="small"),
+                "role": st.column_config.SelectboxColumn("Role", options=list(planner.ROLES), width="small",
+                                                         help="Presets in tab ③ use the role: Cost first boosts 'cost', Quality first boosts 'quality' …"),
             })
         used = edited[edited["use"] & (edited["weight"] > 0)]
         limit_only = edited[~(edited["use"] & (edited["weight"] > 0)) & (edited["min allowed"].notna() | edited["max allowed"].notna())]
@@ -462,22 +462,57 @@ with tab_plan:
 
 
 # ============================================================ weight adjustment (tab ③)
-PRESET_FACTORS = {
-    "Plan weights (AI / edited)": {},
+# Each preset gives the emphasised role(s) a fixed SHARE of the total weight (the rest keeps the plan's
+# proportions). A share - not a multiplier - guarantees the preset really changes the priorities,
+# however many other criteria the dataset has.
+PRESETS = {
+    "Plan weights (AI / edited)": None,
     "Balanced (equal weights)": "equal",
-    "Cost first": {"cost": 3.0},
-    "Quality first": {"quality": 3.0},
-    "Delivery / urgent": {"delivery": 3.0},
-    "Risk-averse": {"risk": 3.0, "quality": 1.5, "financial": 1.5},
-    "Working-capital saver": {"financial": 3.0, "cost": 1.5},
+    "Cost first": {"cost": 0.60},
+    "Quality first": {"quality": 0.60},
+    "Delivery / urgent": {"delivery": 0.60},
+    "Risk-averse": {"risk": 0.35, "quality": 0.25},
+    "Working-capital saver": {"financial": 0.45, "cost": 0.15},
 }
 
 
-def _preset_weights(plan_criteria: list[dict], preset: str) -> dict:
-    f = PRESET_FACTORS[preset]
-    if f == "equal":
-        return {c["column"]: 10 for c in plan_criteria}
-    return {c["column"]: int(min(100, round(c["weight"] * f.get(c.get("role", "other"), 1.0)))) for c in plan_criteria}
+def _role(c: dict) -> str:
+    return planner.role_of(c, c["column"])
+
+
+def preset_weights(plan_criteria: list[dict], preset: str) -> tuple[dict, str]:
+    """Returns ({column: weight 0-100}, note). The note explains what the preset did (or why it could not)."""
+    spec = PRESETS[preset]
+    plan_w = {c["column"]: max(float(c["weight"]), 0.0) for c in plan_criteria}
+    if spec is None:
+        return {k: int(round(v)) for k, v in plan_w.items()}, ""
+    if spec == "equal":
+        return {k: 10 for k in plan_w}, "Every criterion counts the same."
+    present = {r: [c for c in plan_criteria if _role(c) == r] for r in spec}
+    present = {r: cs for r, cs in present.items() if cs}
+    primary = next(iter(spec))                     # the role the preset is named after must exist
+    if primary not in present:
+        wanted = primary
+        return {k: int(round(v)) for k, v in plan_w.items()}, (
+            f"⚠️ This dataset has no {wanted} criterion, so this preset cannot change anything. "
+            f"Tick a {wanted} column in tab ② (or set its Role there).")
+    share = {r: spec[r] for r in present}
+    rest = [c for c in plan_criteria if _role(c) not in present]
+    rest_total = sum(plan_w[c["column"]] for c in rest) or 1.0
+    rest_share = max(0.0, 1.0 - sum(share.values())) if rest else 0.0
+    if not rest:                                   # only emphasised roles exist: normalise their shares
+        tot = sum(share.values())
+        share = {r: v / tot for r, v in share.items()}
+    out = {}
+    for r, cs in present.items():
+        tot = sum(plan_w[c["column"]] for c in cs) or len(cs)
+        for c in cs:
+            out[c["column"]] = share[r] * ((plan_w[c["column"]] or 1) / tot)
+    for c in rest:
+        out[c["column"]] = rest_share * plan_w[c["column"]] / rest_total
+    out = {k: max(1, int(round(v * 100))) if v > 0 else 0 for k, v in out.items()}
+    names = "; ".join(f"{r}: {', '.join(c['label'][:20] for c in cs)} = {int(share[r] * 100)}%" for r, cs in present.items())
+    return out, f"Emphasis → {names} of the total weight; the other criteria share the rest in the plan's proportions."
 
 
 def weight_panel(plan_criteria: list[dict], dkey: str) -> list[dict]:
@@ -487,25 +522,31 @@ def weight_panel(plan_criteria: list[dict], dkey: str) -> list[dict]:
     kp = f"w_{dkey}_{sig}_"
 
     def apply_preset():
-        for col, w in _preset_weights(plan_criteria, ss[kp + "preset"]).items():
-            ss[kp + col] = w
+        w, note = preset_weights(plan_criteria, ss[kp + "preset"])
+        for col, v in w.items():
+            ss[kp + col] = v
+        ss[kp + "note"] = note
 
     for c in plan_criteria:
         ss.setdefault(kp + c["column"], int(round(c["weight"])))
     with st.expander("⚖️ Adjust weights - what matters more to you? (re-ranks instantly, no AI call)", expanded=True):
         c1, c2 = st.columns([3, 1])
-        c1.selectbox("Start from a preset", list(PRESET_FACTORS), key=kp + "preset", on_change=apply_preset,
-                     help="Presets scale the plan's weights by role (cost, quality, delivery, risk, financial). Fine-tune with the sliders.")
+        c1.selectbox("Start from a preset", list(PRESETS), key=kp + "preset", on_change=apply_preset,
+                     help="A preset gives the chosen role (cost, quality, delivery, risk, financial) a fixed share of the total weight. "
+                          "Fine-tune with the sliders.")
         c2.markdown("<div style='height:1.8rem'></div>", unsafe_allow_html=True)
         def reset():
             ss[kp + "preset"] = "Plan weights (AI / edited)"
             apply_preset()
         c2.button("↺ Reset to plan", width="stretch", key=kp + "reset", on_click=reset)
+        note = ss.get(kp + "note", "")
+        if note:
+            (st.warning if note.startswith("⚠️") else st.caption)(note)
         cols = st.columns(3)
         for i, c in enumerate(plan_criteria):
             arrow = "↓ lower is better" if c["direction"] == "lower" else "↑ higher is better"
             cols[i % 3].slider(f"{c['label'][:32]}  ({arrow})", 0, 100, step=1, key=kp + c["column"],
-                               help=f"Plan weight: {c['weight']:g}. Role: {c.get('role', 'other')}.")
+                               help=f"Plan weight: {c['weight']:g}. Role: {_role(c)}.")
         new = [dict(c, weight=float(ss[kp + c["column"]])) for c in plan_criteria]
         total = sum(c["weight"] for c in new)
         if total <= 0:
@@ -578,6 +619,30 @@ with tab_rank:
             k3.metric("Score", f"{top['score']:.1f} / 100", top["tier"], delta_color="off", delta_arrow="off")
             k4.metric("Rank stability", f"{win:.0f}%", help="Share of 500 random ±25% weight variations in which this option stays #1.")
             k5.metric("Pareto-efficient", f"{len(pareto_ids):,}", help="Options that no other option beats on every criterion at once.")
+
+            # ---- what each priority would recommend (explains when the #1 does / does not change)
+            rows_p = []
+            for pname in PRESETS:
+                pw_, pnote = preset_weights(plan_criteria, pname)
+                pc = [dict(c, weight=float(pw_[c["column"]])) for c in plan_criteria if pw_[c["column"]] > 0]
+                if not pc or (pnote.startswith("⚠️")):
+                    rows_p.append({"Priority": pname, "#1": "- (no matching criteria)", "Score": None, "Runner-up": ""})
+                    continue
+                ps = scoring.score(qualified, pc)
+                rows_p.append({"Priority": pname, "#1": f"{ps.iloc[0]['_id']}" + (f" · {str(ps.iloc[0]['_label'])[:24]}" if ps.iloc[0]['_label'] != ps.iloc[0]['_id'] else ""),
+                               "Score": float(ps.iloc[0]["score"]), "Runner-up": str(ps.iloc[1]["_id"]) if len(ps) > 1 else ""})
+            rows_p.insert(0, {"Priority": "▶ Your current weights", "#1": f"{top['_id']}" + (f" · {str(top['_label'])[:24]}" if top['_label'] != top['_id'] else ""),
+                              "Score": float(top["score"]), "Runner-up": str(scored.iloc[1]["_id"]) if len(scored) > 1 else ""})
+            winners = {r["#1"] for r in rows_p[1:] if r["Score"] is not None}
+            with st.expander(f"🔀 What each priority would recommend - {len(winners)} different #1 option(s) across {len(rows_p) - 1} priorities",
+                             expanded=False):
+                st.dataframe(pd.DataFrame(rows_p), hide_index=True, width="stretch",
+                             column_config={"Score": st.column_config.NumberColumn(format="%.1f")})
+                if len(winners) == 1:
+                    st.caption(f"The same option wins under every priority: it is not weak on anything important, so the recommendation "
+                               f"does not depend on the weights (a robust result, not an error). Stability {win:.0f}% says the same.")
+                else:
+                    st.caption("Different priorities pick different options - the weights you choose matter here.")
 
             st.markdown("#### Ranked options")
             show = pd.DataFrame({"#": scored["rank"], "ID": scored["_id"], "Name": scored["_label"], "Tier": scored["tier"],

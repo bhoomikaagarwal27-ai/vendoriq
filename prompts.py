@@ -38,7 +38,8 @@ HOW TO DECIDE
     risk, distance, MOQ -> lower; quality, on-time %, rating, audit score, capacity, credit/payment
     days, certification yes=1 -> higher; a DATE is converted to "age in days" -> usually lower),
     weight 0-100 reflecting typical procurement importance (cost and quality usually highest),
-    role: cost | quality | delivery | risk | financial | sustainability | capacity | other,
+    role: cost | quality | delivery | risk | financial | sustainability | capacity | volume | other
+    (exactly one of these words; "volume" = totals/counts of business done, give it weight 0),
     a short reason.
 - If the table was summarised per vendor: columns ending "_avg" are averages per vendor, "_total" are sums
   (business volume - usually low weight, they favour big vendors), "records" counts rows, and "lead_time_days_…"
